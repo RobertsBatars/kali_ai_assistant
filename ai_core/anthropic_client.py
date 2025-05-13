@@ -1,227 +1,365 @@
-# ai_core/anthropic_client.py
-import anthropic
-import config
+# kali_ai_tool.py
+import json
+import readline
+import sys
 import logging
+import time
+import re # For parsing multiple tool calls
 
-logger = logging.getLogger(f"{config.SERVICE_NAME}.AnthropicClient")
+import config
+from ai_core.anthropic_client import AnthropicClient
+from tools.base_tool import BaseTool
+from tools.command_line_tool import CommandLineTool
+from tools.web_search_tool import WebSearchTool
+from tools.cve_search_tool import CVESearchTool
+from utils.interrupt_handler import InterruptHandler
+from utils.logger_setup import setup_logging
+from utils.token_estimator import estimate_messages_token_count
 
-class AnthropicClient:
-    def __init__(self, api_key=None, model_name=None):
-        self.api_key = api_key or config.ANTHROPIC_API_KEY
-        if not self.api_key:
-            logger.error("Anthropic API key is not configured.")
-            raise ValueError("Anthropic API key is not configured. Please set ANTHROPIC_API_KEY in your .env file.")
-        
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model_name = model_name or config.DEFAULT_AI_MODEL
-        self.interrupted = False
-        logger.info(f"AnthropicClient initialized with model: {self.model_name}")
+logger = setup_logging(
+    log_file_path=config.LOG_FILE_PATH,
+    log_level_file=config.LOG_LEVEL_FILE,
+    log_level_console=config.LOG_LEVEL_CONSOLE,
+    service_name=config.SERVICE_NAME
+)
 
-    def set_interrupted(self, interrupted_status):
-        if self.interrupted != interrupted_status:
-            logger.debug(f"Interruption status set to: {interrupted_status}")
-        self.interrupted = interrupted_status
+# --- Initial Setup (load prompts, AI client, tools, etc.) ---
+try:
+    with open("system_prompt.txt", "r") as f:
+        SYSTEM_PROMPT = f.read()
+    logger.info("System prompt loaded successfully.")
+except FileNotFoundError:
+    print("CRITICAL: system_prompt.txt not found. Please create it.", file=sys.stderr)
+    logger.critical("CRITICAL: system_prompt.txt not found.")
+    sys.exit(1)
+except Exception as e:
+    print(f"CRITICAL: Error reading system_prompt.txt: {e}", file=sys.stderr)
+    logger.critical(f"CRITICAL: Error reading system_prompt.txt: {e}", exc_info=True)
+    sys.exit(1)
 
-    def get_response(self, system_prompt, messages, max_tokens=None):
-        """
-        Gets a response from the Anthropic API using streaming.
-        The method accumulates the streamed response and returns it as a whole.
-        Args:
-            system_prompt (str): The system prompt.
-            messages (list): Conversation history.
-            max_tokens (int, optional): Max tokens for generation. Defaults to config.MAX_AI_OUTPUT_TOKENS.
-        Returns:
-            tuple(str | None, str | None): (The AI's response content, stop_reason) or (None, "error" or "interrupted")
-        """
-        if self.interrupted:
-            logger.info("AI interaction interrupted before API call.")
-            return None, "interrupted"
-        
-        effective_max_tokens = max_tokens if max_tokens is not None else config.MAX_AI_OUTPUT_TOKENS
-        accumulated_text = []
-        final_stop_reason = None
-        
+try:
+    ai_client = AnthropicClient()
+    logger.info("AnthropicClient initialized.")
+except ValueError as e:
+    print(f"CRITICAL: Error initializing AI Client: {e}. Check ANTHROPIC_API_KEY.", file=sys.stderr)
+    logger.critical(f"CRITICAL: Error initializing AI Client: {e}.", exc_info=True)
+    sys.exit(1)
+except Exception as e:
+    print(f"CRITICAL: Unexpected error initializing AI Client: {e}", file=sys.stderr)
+    logger.critical(f"CRITICAL: Unexpected error initializing AI Client: {e}", exc_info=True)
+    sys.exit(1)
+
+available_tools: dict[str, BaseTool] = {
+    "command_line": CommandLineTool(),
+    "web_search": WebSearchTool(),
+    "cve_search": CVESearchTool(),
+}
+logger.info(f"Available tools initialized: {list(available_tools.keys())}")
+
+interrupt_handler = InterruptHandler()
+logger.info("InterruptHandler initialized.")
+
+conversation_history = []
+
+# --- Helper Functions (print_*, manage_conversation_history, execute_tool, parse_ai_response_for_actions) ---
+# These functions are assumed to be the same as in the previous version you provided.
+# For brevity, I'm omitting them here but they should be included.
+
+def print_ai_message(message: str):
+    logger.info(f"AI: {message[:1000]}{'...' if len(message) > 1000 else ''}")
+    print(f"\n🤖 Assistant:\n{message}")
+
+def print_user_message_log(message: str):
+    logger.info(f"User: {message}")
+
+def print_tool_being_used(tool_name: str, tool_args: dict):
+    args_str = json.dumps(tool_args)
+    if len(args_str) > 100: args_str = args_str[:100] + "..."
+    message = f"Attempting to use tool: '{tool_name}' with arguments: {args_str}"
+    logger.info(message)
+    print(f"\n⚙️ System: {message}")
+
+def print_tool_output(tool_name: str, output: str):
+    logger.info(f"Tool ({tool_name}) Output: {output[:1000]}{'...' if len(output) > 1000 else ''}")
+    print(f"\n🛠️ Tool Output ({tool_name}):\n{output}")
+
+def print_system_console_message(message: str, is_error=False):
+    log_level = logging.ERROR if is_error else logging.INFO
+    logger.log(log_level, f"SystemConsole: {message}")
+    print(f"\n⚙️ System:\n{message}")
+
+def manage_conversation_history_and_summarize():
+    global conversation_history
+    current_tokens = estimate_messages_token_count(conversation_history)
+    logger.debug(f"Current estimated token count: {current_tokens}. Soft limit: {config.CONTEXT_TOKEN_SOFT_LIMIT}")
+    if current_tokens > config.CONTEXT_TOKEN_SOFT_LIMIT and len(conversation_history) > config.MIN_MESSAGES_TO_KEEP_BEFORE_SUMMARY:
+        print_system_console_message(f"Context length ({current_tokens} tokens) nearing limit. Attempting summarization...")
+        messages_to_keep_suffix = conversation_history[-config.MIN_MESSAGES_TO_KEEP_BEFORE_SUMMARY:]
+        messages_to_summarize = conversation_history[:-config.MIN_MESSAGES_TO_KEEP_BEFORE_SUMMARY]
+        if not messages_to_summarize:
+            logger.info("Not enough messages to summarize after keeping suffix.")
+            return False
+        summary_text = ai_client.summarize_conversation(messages_to_summarize, config.SUMMARIZED_HISTORY_TARGET_TOKENS)
+        if interrupt_handler.is_interrupted():
+            print_system_console_message("Summarization interrupted by user.")
+            return True
+        if summary_text:
+            new_history = [{"role": "system", "content": f"Previous conversation summary: {summary_text}"}]
+            new_history.extend(messages_to_keep_suffix)
+            old_tokens_summarized_part = estimate_messages_token_count(messages_to_summarize)
+            new_tokens_summary_part = estimate_messages_token_count([new_history[0]])
+            reduction = old_tokens_summarized_part - new_tokens_summary_part # noqa: F841
+            conversation_history = new_history
+            new_total_tokens = estimate_messages_token_count(conversation_history) # noqa: F841
+            print_system_console_message(f"Conversation history summarized. Token count reduced by approx {reduction} to {new_total_tokens}.")
+            return True
+        else:
+            logger.warning("Failed to summarize conversation history. Proceeding with full history.")
+            print_system_console_message("Failed to summarize conversation history.")
+            if current_tokens > config.CONTEXT_TOKEN_HARD_LIMIT:
+                 logger.error(f"CRITICAL: Token count ({current_tokens}) exceeds hard limit ({config.CONTEXT_TOKEN_HARD_LIMIT}). AI may truncate.")
+                 print_system_console_message(f"WARNING: Token count ({current_tokens}) exceeds hard limit. AI may truncate or fail.", is_error=True)
+            return True
+    return False
+
+def execute_tool(tool_name: str, arguments: dict) -> str:
+    if tool_name in available_tools:
+        tool = available_tools[tool_name]
+        if tool_name == "command_line" and config.REQUIRE_COMMAND_CONFIRMATION:
+            command_to_run = arguments.get("command")
+            if command_to_run and not arguments.get("stdin_input") and not arguments.get("terminate_interactive"):
+                confirm_prompt = f"AI wants to execute: '{command_to_run}'. Allow? (yes/no): "
+                try:
+                    user_confirmation = input(confirm_prompt).strip().lower()
+                    if user_confirmation != "yes":
+                        logger.info(f"User declined execution of command: {command_to_run}")
+                        return "User declined command execution."
+                    logger.info(f"User approved execution of command: {command_to_run}")
+                except EOFError:
+                    logger.warning("EOF received during command confirmation.")
+                    return "User declined command execution (EOF)."
+                except KeyboardInterrupt:
+                    interrupt_handler.handle_interrupt(None, None)
+                    logger.warning("KeyboardInterrupt during command confirmation.")
+                    return "User interrupted command confirmation."
+        tool.set_interrupted(interrupt_handler.is_interrupted())
         try:
-            if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-                logger.error(f"Invalid messages format: {type(messages)}. Expected list of dicts.")
-                raise ValueError("Messages must be a list of dictionaries.")
-
-            logger.debug(f"Opening stream to Anthropic. Model: {self.model_name}, System Prompt (len): {len(system_prompt)}, Messages (count): {len(messages)}, Max Tokens: {effective_max_tokens}")
-            
-            with self.client.messages.stream(
-                model=self.model_name,
-                max_tokens=effective_max_tokens,
-                system=system_prompt,
-                messages=messages
-            ) as stream:
-                for event in stream:
-                    if self.interrupted:
-                        logger.info("AI stream processing interrupted by flag.")
-                        stream.close() # Attempt to close the stream
-                        return "".join(accumulated_text) if accumulated_text else None, "interrupted"
-
-                    if event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            # logger.debug(f"Stream text delta: '{event.delta.text}'") # Can be very verbose
-                            accumulated_text.append(event.delta.text)
-                    # The stop_reason might also be available in message_delta or message_stop events
-                    # but get_final_message() is the most robust way to get the complete message object.
-
-                # After the loop, finalize the message
-                final_message = stream.get_final_message()
-                final_stop_reason = final_message.stop_reason
-                # The accumulated_text should match final_message.content[0].text if there's only one text block
-                # For safety, we use the accumulated text from deltas.
-                
-            full_response_text = "".join(accumulated_text)
-            logger.info(f"Stream finished. Total content length: {len(full_response_text)}, Stop Reason: {final_stop_reason}")
-            logger.debug(f"Anthropic final message object from stream: {final_message}")
-            
-            return full_response_text, final_stop_reason
-
-        except anthropic.APIConnectionError as e:
-            logger.error(f"Anthropic API connection error: {e}")
-            print(f"Anthropic API connection error: {e}")
-        except anthropic.RateLimitError as e:
-            logger.error(f"Anthropic API rate limit exceeded: {e}")
-            print(f"Anthropic API rate limit exceeded: {e}")
-        except anthropic.APIStatusError as e: # Includes APIResponseValidationError for unexpected stream events
-            logger.error(f"Anthropic API status/response error: {e.status_code} - {e.response if hasattr(e, 'response') else e}", exc_info=True)
-            print(f"Anthropic API status/response error: {e.status_code if hasattr(e, 'status_code') else 'N/A'} - {e.response if hasattr(e, 'response') else e}")
-        except anthropic.APIError as e:
-            logger.error(f"Anthropic API error: {e}", exc_info=True)
-            print(f"Anthropic API error: {e}")
+            return tool.execute(arguments)
         except Exception as e:
-            logger.error(f"An unexpected error occurred during Anthropic stream: {e}", exc_info=True)
-            print(f"An unexpected error occurred during Anthropic stream: {e}")
-        
-        return "".join(accumulated_text) if accumulated_text else None, "error"
+            logger.error(f"Exception during tool execution '{tool_name}': {str(e)}", exc_info=True)
+            return f"Error during tool execution '{tool_name}': {str(e)}"
+    else:
+        logger.error(f"Tool '{tool_name}' not found.")
+        return f"Error: Tool '{tool_name}' not found."
 
-
-    def summarize_conversation(self, conversation_history: list[dict], target_token_count: int) -> str | None:
-        """
-        Uses the Anthropic model to summarize a conversation history (also uses streaming internally).
-        """
-        if self.interrupted:
-            logger.info("Summarization interrupted before API call.")
-            return None
-
-        if not conversation_history:
-            logger.info("No conversation history to summarize.")
-            return None
-
-        summarization_system_prompt = (
-            "You are a summarization expert. Summarize the following conversation concisely, "
-            "focusing on key facts, decisions, user requests, and outcomes. "
-            "The summary should be a coherent narrative that captures the essence of the conversation. "
-            f"Aim for a summary that is approximately {target_token_count} tokens long. "
-            "Retain critical information, especially unresolved questions or ongoing tasks. "
-            "Output ONLY the summary text, without any preamble or sign-off."
-        )
-        
-        logger.info(f"Requesting summarization for {len(conversation_history)} messages. Target tokens: {target_token_count}")
-        
+def parse_ai_response_for_actions(ai_response: str) -> list:
+    actions = []
+    if not ai_response: return actions
+    pattern = re.compile(r"(.*?)<tool_call>(.*?)</tool_call>", re.DOTALL)
+    last_end = 0
+    for match in pattern.finditer(ai_response):
+        pre_text = match.group(1).strip()
+        tool_json_str = match.group(2).strip()
+        if pre_text: actions.append(("text", pre_text))
         try:
-            # Determine max_tokens for summary generation
-            # This should be related to target_token_count, but give it some leeway.
-            max_summary_gen_tokens = int(target_token_count * 1.5) 
-            if max_summary_gen_tokens < 500: max_summary_gen_tokens = 500 # Minimum reasonable summary length
-            # Cap summary generation length to avoid excessive token use for summaries
-            # This should be less than config.MAX_AI_OUTPUT_TOKENS if that is very large.
-            # Let's use a fixed cap like 4096 for summaries unless target is larger.
-            if max_summary_gen_tokens > 4096: max_summary_gen_tokens = 4096 
-            if target_token_count > 4096 : max_summary_gen_tokens = int(target_token_count * 1.2) # If target is huge
+            tool_data = json.loads(tool_json_str)
+            tool_name, arguments = tool_data.get("tool_name"), tool_data.get("arguments")
+            if tool_name and isinstance(arguments, dict):
+                actions.append(("tool", (tool_name, arguments)))
+                logger.info(f"Parsed tool action: {tool_name}, Args: {arguments}")
+            else:
+                actions.append(("text", f"<tool_call>{tool_json_str}</tool_call>")) # Malformed
+        except json.JSONDecodeError:
+            actions.append(("text", f"<tool_call>{tool_json_str}</tool_call>")) # Unparsable
+        last_end = match.end()
+    remaining_text = ai_response[last_end:].strip()
+    if remaining_text: actions.append(("text", remaining_text))
+    if not actions and ai_response: actions.append(("text", ai_response.strip()))
+    return actions
 
 
-            summary_text, stop_reason = self.get_response(
-                system_prompt=summarization_system_prompt,
-                messages=conversation_history,
-                max_tokens=max_summary_gen_tokens
-            )
+# --- Main Application Loop ---
+def main():
+    global conversation_history
+    print_system_console_message(f"{config.SERVICE_NAME} started. Type 'exit' or 'quit' to end.")
+    logger.info(f"Application main loop started. Model: {config.DEFAULT_AI_MODEL}, Max Output Tokens: {config.MAX_AI_OUTPUT_TOKENS}")
+    
+    while True: # Outer loop for user input
+        interrupt_handler.reset()
+        ai_client.set_interrupted(False)
+        for tool in available_tools.values(): tool.set_interrupted(False)
 
-            if summary_text and stop_reason not in ["error", "interrupted"]:
-                logger.info(f"Summarization successful. Summary length: {len(summary_text)} chars. Stop reason: {stop_reason}")
-                return summary_text
+        try:
+            user_input = input("\n👤 You: ").strip()
+        except KeyboardInterrupt: # Ctrl+C at "You:" prompt
+            if interrupt_handler.is_interrupted(): # Second Ctrl+C
+                print_system_console_message("Exiting due to repeated Ctrl+C.")
+                break
+            interrupt_handler.handle_interrupt(None, None) # First Ctrl+C
+            print_system_console_message("Input interrupted. Type 'exit' or press Ctrl+C again to quit.")
+            continue
+        except EOFError: # Ctrl+D
+            print_system_console_message("EOF received. Exiting.")
+            break
+        
+        if user_input.lower() in ["exit", "quit"]:
+            print_system_console_message(f"Exiting {config.SERVICE_NAME}.")
+            break
+        if not user_input: continue
+
+        print_user_message_log(user_input)
+        conversation_history.append({"role": "user", "content": user_input})
+
+        # --- Iterative AI Turn Processing ---
+        # This loop continues as long as the AI's response leads to further actions (tool calls or continued text).
+        
+        # Start with no prior AI response text for this user turn
+        current_ai_response_text_to_process = None 
+        is_first_pass_for_user_input = True
+
+        while True: # Inner loop for sequential AI responses and tool calls within a single user "turn"
+            if interrupt_handler.is_interrupted():
+                print_system_console_message("AI turn processing interrupted by user flag.")
+                break # Break from this AI's multi-step turn, go to next user input
+
+            if is_first_pass_for_user_input or current_ai_response_text_to_process is None:
+                # Get initial AI response or response to previous tool's observation
+                manage_conversation_history_and_summarize()
+                if interrupt_handler.is_interrupted(): break
+
+                ai_client.set_interrupted(interrupt_handler.is_interrupted())
+                ai_response_text, stop_reason = ai_client.get_response(SYSTEM_PROMPT, conversation_history)
+                is_first_pass_for_user_input = False # Subsequent passes are follow-ups
+
+                if interrupt_handler.is_interrupted() or stop_reason == "interrupted":
+                    print_system_console_message("AI response generation interrupted.")
+                    break 
+                
+                if not ai_response_text:
+                    print_system_console_message("AI did not provide a response. Please try again.", is_error=True)
+                    # If this was a response to user's direct input, pop user input.
+                    # If it was a response to an observation, the observation remains.
+                    if conversation_history and conversation_history[-1]["role"] == "user" and \
+                       not conversation_history[-1]["content"].startswith("Observation:"):
+                         conversation_history.pop()
+                    break 
+                
+                conversation_history.append({"role": "assistant", "content": ai_response_text})
+                current_ai_response_text_to_process = ai_response_text
             
-            logger.warning(f"Summarization response content is empty or an error occurred. Stop reason: {stop_reason}. Summary text: '{summary_text}'")
-            return None
-        except Exception as e: # Catch any other unexpected error from get_response or logic here
-            logger.error(f"Error during summarization call: {e}", exc_info=True)
-            return None
+            # Now, process actions from current_ai_response_text_to_process
+            actions = parse_ai_response_for_actions(current_ai_response_text_to_process)
+            logger.debug(f"Processing actions: {actions}")
 
+            if not actions: # AI provided empty text or unparsable response
+                logger.info("No further actions from AI in this pass. AI turn complete.")
+                break # AI's current thought process is done.
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    test_logger = logging.getLogger("AnthropicClientTest")
-    # Ensure config.py is in the parent directory or adjust path if running this file directly
-    # For testing, you might need to temporarily add `sys.path.append('..')` if config is not found
-    # import sys
-    # sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-    # import config # Now config should be found
+            # Assume this is the last part of AI's response unless a tool is called
+            next_iteration_needed_for_this_ai_turn = False 
+            
+            # Process only the first action. If it's text, print. If tool, execute.
+            # The loop will then decide if it needs to re-prompt AI based on tool output.
+            
+            action_type, action_content = actions.pop(0) # Get and remove first action
+            remaining_ai_text_to_process_later = None
+            if actions: # If there are more actions in the AI's current response block
+                # Temporarily convert remaining actions back to a string to be processed in the next iteration
+                # This is a simplification. A more robust way would be to queue these actions.
+                # For now, we'll focus on the AI reacting to one tool at a time.
+                # If AI gives Text1 <Tool1> Text2 <Tool2>, we process Text1, then Tool1.
+                # After Tool1's observation, AI should give Text2 <Tool2>.
+                
+                # If the first action was text, and there's a tool call immediately after,
+                # we should process that tool call.
+                # The logic here is tricky if AI gives: Text -> Tool -> Text -> Tool.
+                # The system prompt guides it to give Text -> Tool(s) -> Wait for Obs -> Text -> Tool(s)
+                
+                # Let's process all text actions first from the current AI response
+                if action_type == "text":
+                    print_ai_message(action_content)
+                    # See if next action is a tool
+                    if actions and actions[0][0] == "tool":
+                        action_type, action_content = actions.pop(0)
+                    else: # Next action is text or no more actions from this AI block
+                        current_ai_response_text_to_process = None # Signal this AI block is done if only text
+                        if actions: # More text follows
+                           current_ai_response_text_to_process = actions[0][1] # Assuming it's ("text", content)
+                           actions.pop(0)
+                           if actions: logger.warning("Unhandled subsequent actions after text block.")
+                        if not current_ai_response_text_to_process:
+                            break # End of AI turn if only text was processed
+                        # If there was more text, loop will re-parse and print it.
+                        # This is still not perfect for Text -> Tool -> Text -> Tool from one AI response.
+                        # The expectation is AI gives Text -> Tool(s), then waits.
 
+            # Refined logic: Process all text, then the first tool call.
+            # The `parse_ai_response_for_actions` gives a list. We iterate it.
+            # If a tool is run, we break from iterating these actions and send observation.
+            
+            # Reset for current_ai_response_text_to_process
+            current_ai_response_text_to_process = None # Assume this block is done unless a tool runs
+
+            for i, (act_type, act_content) in enumerate(actions): # Use original `actions` list
+                if interrupt_handler.is_interrupted(): break
+
+                if act_type == "text":
+                    print_ai_message(act_content)
+                elif act_type == "tool":
+                    tool_name, tool_args = act_content
+                    print_tool_being_used(tool_name, tool_args)
+                    tool_output_str = execute_tool(tool_name, tool_args)
+
+                    if "User interrupted command confirmation." in tool_output_str and interrupt_handler.is_interrupted():
+                        print_system_console_message("Command confirmation was interrupted by user.")
+                        conversation_history.append({"role": "user", "content": f"Observation for {tool_name}: User interrupted command confirmation."})
+                        next_iteration_needed_for_this_ai_turn = True
+                        break # Stop processing this list of actions, AI needs to react
+                    
+                    print_tool_output(tool_name, tool_output_str)
+                    conversation_history.append({"role": "user", "content": f"Observation for tool '{tool_name}':\n{tool_output_str}"})
+                    next_iteration_needed_for_this_ai_turn = True # AI needs to react to this observation
+
+                    # If a command is still running or blocked, AI *must* react to this before anything else.
+                    if tool_name == "command_line" and \
+                       ("Process is running" in tool_output_str or "Error: Another command" in tool_output_str or "Command interrupted." in tool_output_str):
+                        logger.info(f"Command '{tool_args.get('command')}' state requires AI re-evaluation. Stopping further actions from current AI plan.")
+                        break # Break from iterating current AI's planned actions
+
+            # After iterating through actions from one AI response block
+            if interrupt_handler.is_interrupted(): break # Break from inner while loop
+
+            if not next_iteration_needed_for_this_ai_turn:
+                # No tools were run, or tools run didn't require immediate AI follow-up (e.g. finished cleanly without being interactive)
+                # and no other condition (like max_tokens) requires re-prompting.
+                # So, AI's current "thought" or sequence for this user input is complete.
+                logger.debug("No tools run or no immediate follow-up needed from AI. Ending AI turn.")
+                break # Break from inner while loop, wait for next user input.
+            
+            # If next_iteration_needed_for_this_ai_turn is True, the loop continues,
+            # and it will call get_response() again with updated history.
+            # current_ai_response_text_to_process will be set by the next get_response() call.
+
+            if stop_reason == "max_tokens": # Check original stop_reason for the block of actions
+                print_system_console_message("Warning: AI's response may have been cut short. It will try to continue.", is_error=True)
+                conversation_history.append({"role": "user", "content": "Observation: Your previous response might have been truncated due to maximum token limit. Please continue if you had more to say or do."})
+                # The loop will continue and re-prompt AI.
+        # End of inner `while True` loop (sequential AI responses/tool calls)
+    # End of outer `while True` (user input loop)
+
+if __name__ == "__main__":
+    # ... (same as before) ...
     try:
-        client = AnthropicClient() # Uses config for API key and model
-        
-        prompt_file_path = "../system_prompt.txt" # If in ai_core
-        # Check if running from project root instead
-        import os
-        if not os.path.exists(prompt_file_path):
-            prompt_file_path = "system_prompt.txt"
-
-        try:
-            with open(prompt_file_path, "r") as f: 
-                test_system_prompt = f.read()
-            test_logger.info(f"Loaded system prompt from {prompt_file_path}")
-        except FileNotFoundError:
-            test_logger.error(f"Error: system_prompt.txt not found at {prompt_file_path} or ./system_prompt.txt.")
-            test_system_prompt = "You are a helpful assistant."
-
-
-        test_messages_regular = [
-            {"role": "user", "content": "Hello, who are you and what can you do in a short sentence?"}
-        ]
-        
-        test_logger.info("--- Testing Regular Response (Streamed but Accumulated) ---")
-        ai_response, stop_reason = client.get_response(system_prompt=test_system_prompt, messages=test_messages_regular)
-        
-        if ai_response:
-            test_logger.info(f"AI Response:\n{ai_response}\nStop Reason: {stop_reason}")
-        else:
-            test_logger.warning(f"Failed to get response from AI. Stop Reason: {stop_reason}")
-
-        test_logger.info("\n--- Testing Summarization (Streamed but Accumulated) ---")
-        sample_history_for_summary = [
-            {"role": "user", "content": "What was the first step we discussed for reconnaissance?"},
-            {"role": "assistant", "content": "We talked about using nmap for initial port scanning."},
-            {"role": "user", "content": "And after that, what tool did I mention for web enumeration?"},
-            {"role": "assistant", "content": "You mentioned using Gobuster to find directories and files."},
-            {"role": "user", "content": "Correct. And what was the target IP?"},
-            {"role": "assistant", "content": "The target IP was 10.0.0.5."},
-        ]
-        
-        summary = client.summarize_conversation(sample_history_for_summary, target_token_count=30) # Short summary
-        if summary:
-            test_logger.info("Generated Summary:\n" + summary)
-        else:
-            test_logger.warning("Failed to generate summary.")
-            
-        test_logger.info("\n--- Testing Interruption during stream (simulated) ---")
-        # To truly test interruption, you'd need to set client.interrupted = True from another thread
-        # during the stream. This is a conceptual test.
-        client.set_interrupted(True)
-        interrupted_response, interrupted_reason = client.get_response(
-            system_prompt=test_system_prompt, 
-            messages=[{"role": "user", "content": "Tell me a very long story that will take time to generate."}]
-        )
-        client.set_interrupted(False) # Reset for other tests
-        if interrupted_reason == "interrupted":
-            test_logger.info(f"Interruption test successful. Partial response: '{interrupted_response}', Reason: {interrupted_reason}")
-        else:
-            test_logger.error(f"Interruption test failed or completed too quickly. Response: '{interrupted_response}', Reason: {interrupted_reason}")
-
-
-    except ValueError as ve:
-        test_logger.critical(f"Configuration Error: {ve}")
+        main()
+    except SystemExit:
+        pass
     except Exception as e:
-        test_logger.critical(f"An error occurred during testing: {e}", exc_info=True)
-
+        logger.critical(f"--- An unexpected critical error occurred in main: {e} ---", exc_info=True)
+        print(f"\n--- CRITICAL ERROR: {e} ---", file=sys.stderr)
+    finally:
+        logger.info("Application terminated.")
+        current_exception = sys.exc_info()
+        if not (current_exception[0] is None or current_exception[0] is SystemExit):
+             print("\nApplication terminated due to an error.", file=sys.stderr)
+        else:
+             print("\nApplication terminated.")
