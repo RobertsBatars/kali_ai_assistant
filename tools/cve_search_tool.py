@@ -42,7 +42,7 @@ class CVESearchTool(BaseTool):
         
         # Delegate to web search tool. You might prefer a specific engine.
         # For now, it will use the web_search_tool's default or what AI passes.
-        search_args = {"query": search_query, "engine": "google"} # Default to Google for CVEs
+        search_args = {"query": search_query, "engine": "brave"} # Default to Google for CVEs
         
         # Pass interruption status to the sub-tool
         self.web_search_tool.set_interrupted(self.interrupted)
