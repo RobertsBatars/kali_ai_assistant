@@ -4,7 +4,7 @@ import readline
 import sys
 import logging
 import time
-import re 
+# import re # No longer needed if parse_ai_response_for_actions is removed
 
 import config
 from ai_core.anthropic_client import AnthropicClient # Ensure this path is correct
@@ -12,6 +12,7 @@ from tools.base_tool import BaseTool
 from tools.command_line_tool import CommandLineTool
 from tools.web_search_tool import WebSearchTool
 from tools.cve_search_tool import CVESearchTool
+from tools.wait_tool import WaitTool # Import the new WaitTool
 from utils.interrupt_handler import InterruptHandler
 from utils.logger_setup import setup_logging
 from utils.token_estimator import estimate_messages_token_count
@@ -23,51 +24,44 @@ logger = setup_logging(
     service_name=config.SERVICE_NAME
 )
 
-# --- Initial Setup (load prompts, AI client, tools, etc.) ---
+# --- Initial Setup ---
 try:
-    with open("system_prompt.txt", "r") as f:
-        SYSTEM_PROMPT = f.read()
-    logger.info("System prompt loaded successfully.")
+    with open("system_prompt.txt", "r") as f: SYSTEM_PROMPT = f.read()
 except FileNotFoundError:
-    print("CRITICAL: system_prompt.txt not found. Please create it.", file=sys.stderr)
-    sys.exit(1)
-# ... (rest of initial setup: AI client, tools, interrupt handler, history)
+    print("CRITICAL: system_prompt.txt not found.", file=sys.stderr); sys.exit(1)
 try:
     ai_client = AnthropicClient()
 except ValueError as e:
-    print(f"CRITICAL: Error initializing AI Client: {e}", file=sys.stderr)
-    sys.exit(1)
+    print(f"CRITICAL: AI Client Error: {e}", file=sys.stderr); sys.exit(1)
 
 available_tools: dict[str, BaseTool] = {
     "command_line": CommandLineTool(),
     "web_search": WebSearchTool(),
     "cve_search": CVESearchTool(),
+    "wait": WaitTool(), # Add the new WaitTool instance
 }
 interrupt_handler = InterruptHandler()
 conversation_history = []
 
 # --- Helper Functions ---
-# print_user_message_log, print_tool_being_used, print_tool_output, 
+# (print_user_message_log, print_tool_being_used, print_tool_output, 
 # print_system_console_message, manage_conversation_history_and_summarize, execute_tool
-# parse_ai_response_for_actions (NO LONGER USED, logic integrated into stream handling)
-# For brevity, only print_ai_message is shown if unchanged, others assumed present.
+# are assumed to be the same as your latest working version.
+# parse_ai_response_for_actions is NO LONGER USED with the new stream handling)
 
-def print_ai_message_stream_chunk(text_chunk: str):
-    """Prints AI message chunk to console immediately."""
-    print(text_chunk, end="", flush=True)
-
-def print_ai_message_complete(full_message: str):
-    """Prints a newline after a complete AI message segment."""
-    print() # Newline after streamed message
-    logger.info(f"AI (complete segment): {full_message[:1000]}{'...' if len(full_message) > 1000 else ''}")
+def print_ai_message_segment(full_message_segment: str):
+    """Prints a complete segment of AI's text response."""
+    if full_message_segment: # Only print if there's content
+        print(f"\n🤖 Assistant:\n{full_message_segment.strip()}")
+        logger.info(f"AI Segment: {full_message_segment.strip()[:1000]}{'...' if len(full_message_segment) > 1000 else ''}")
 
 def print_user_message_log(message: str): logger.info(f"User: {message}")
 def print_tool_being_used(tool_name: str, tool_args: dict):
     args_str = json.dumps(tool_args)
     if len(args_str) > 100: args_str = args_str[:100] + "..."
-    message = f"Attempting to use tool: '{tool_name}' with arguments: {args_str}"
+    message = f"AI is requesting to use tool: '{tool_name}' with arguments: {args_str}"
     logger.info(message)
-    print(f"\n\n⚙️ System: {message}") # Extra newline for clarity after streamed AI output
+    print(f"\n⚙️ System: {message}") # Ensure newlines for clarity
 
 def print_tool_output(tool_name: str, output: str):
     logger.info(f"Tool ({tool_name}) Output: {output[:1000]}{'...' if len(output) > 1000 else ''}")
@@ -79,7 +73,7 @@ def print_system_console_message(message: str, is_error=False):
     print(f"\n⚙️ System:\n{message}")
 
 def manage_conversation_history_and_summarize():
-    # (This function remains the same as the previous version, ensure it uses print_system_console_message)
+    # (Assumed to be the same, using print_system_console_message)
     global conversation_history
     current_tokens = estimate_messages_token_count(conversation_history)
     logger.debug(f"Current estimated token count: {current_tokens}. Soft limit: {config.CONTEXT_TOKEN_SOFT_LIMIT}")
@@ -98,21 +92,21 @@ def manage_conversation_history_and_summarize():
             conversation_history = new_history
             print_system_console_message("Conversation history summarized.")
             return True
-        else:
+        else: # Summarization failed
             print_system_console_message("Failed to summarize conversation history.", is_error=True)
             if current_tokens > config.CONTEXT_TOKEN_HARD_LIMIT:
                  print_system_console_message(f"WARNING: Token count ({current_tokens}) exceeds hard limit.", is_error=True)
             return True
     return False
 
-
 def execute_tool(tool_name: str, arguments: dict) -> str:
-    # (This function remains the same as the previous version)
+    # (Assumed to be the same, handles confirmation and execution)
     if tool_name in available_tools:
         tool = available_tools[tool_name]
         if tool_name == "command_line" and config.REQUIRE_COMMAND_CONFIRMATION:
             command_to_run = arguments.get("command")
             if command_to_run and not arguments.get("stdin_input") and not arguments.get("terminate_interactive"):
+                print() # Newline before input prompt for clarity
                 confirm_prompt = f"AI wants to execute: '{command_to_run}'. Allow? (yes/no): "
                 try:
                     user_confirmation = input(confirm_prompt).strip().lower()
@@ -135,8 +129,9 @@ def main():
         ai_client.set_interrupted(False)
         for tool in available_tools.values(): tool.set_interrupted(False)
 
+        print() # Ensure a clean line for user input
         try:
-            user_input = input("\n\n👤 You: ").strip() # Extra newline for spacing
+            user_input = input("👤 You: ").strip()
         except KeyboardInterrupt:
             if interrupt_handler.is_interrupted(): break
             interrupt_handler.handle_interrupt(None, None)
@@ -150,9 +145,8 @@ def main():
         print_user_message_log(user_input)
         conversation_history.append({"role": "user", "content": user_input})
         
-        # --- Iterative AI Turn Processing ---
-        needs_ai_response = True
-        while needs_ai_response:
+        needs_ai_to_respond = True
+        while needs_ai_to_respond:
             if interrupt_handler.is_interrupted():
                 print_system_console_message("AI turn processing interrupted by user flag.")
                 break 
@@ -160,108 +154,100 @@ def main():
             manage_conversation_history_and_summarize()
             if interrupt_handler.is_interrupted(): break
 
-            accumulated_ai_preamble = [] # Text from AI before a tool call or end of stream
-            tool_to_execute = None # Tuple: (tool_name, tool_args)
+            accumulated_text_this_segment = []
+            tool_call_action = None 
+            final_stop_reason_for_segment = None
+            preamble_for_tool_call = "" # Text specifically before a detected tool call
             
-            print(f"\n🤖 Assistant: ", end="", flush=True) # Start AI response line
+            # No initial "Assistant:" print here; will be done by print_ai_message_segment
 
             for event_type, data, *extra in ai_client.get_response_stream(SYSTEM_PROMPT, conversation_history):
-                if interrupt_handler.is_interrupted(): # Check during stream consumption
-                    print_system_console_message("\nStream consumption interrupted.")
-                    # Add whatever was accumulated as assistant message
-                    if accumulated_ai_preamble:
-                        conversation_history.append({"role": "assistant", "content": "".join(accumulated_ai_preamble)})
-                    needs_ai_response = False # Stop this AI turn
+                if interrupt_handler.is_interrupted():
+                    print_system_console_message("\nStream consumption interrupted by user.")
+                    if accumulated_text_this_segment:
+                        # Add what we got to history before breaking
+                        full_segment = "".join(accumulated_text_this_segment)
+                        # Don't print here, it might interfere with subsequent input()
+                        # print_ai_message_segment(full_segment) # Print it
+                        conversation_history.append({"role": "assistant", "content": full_segment})
+                    needs_ai_to_respond = False 
                     break 
 
-                if event_type == "text_delta":
-                    print_ai_message_stream_chunk(data)
-                    accumulated_ai_preamble.append(data)
-                elif event_type == "tool_call":
-                    tool_name, tool_args = data, extra[0]
-                    tool_to_execute = (tool_name, tool_args)
-                    # Preamble (accumulated_ai_preamble) is handled after loop
-                    logger.info(f"Tool call received from stream: {tool_name}")
-                    break # Stop processing this stream, execute tool
-                elif event_type == "stream_end":
-                    # data is full_text, extra[0] is stop_reason
-                    final_stop_reason = extra[0]
-                    # The text_buffer from client is 'data'. We've already printed & accumulated it.
-                    print_ai_message_complete("".join(accumulated_ai_preamble)) # Ensure newline
-                    
-                    # Add the complete text segment to history
-                    # If accumulated_ai_preamble is empty but data (full_text_from_client_buffer) is not, use data.
-                    # This handles cases where the stream might end without yielding individual deltas (e.g. very short messages)
-                    # but this shouldn't happen with current client logic.
-                    final_text_segment = "".join(accumulated_ai_preamble) if accumulated_ai_preamble else data
-                    if final_text_segment: # Only add if there was text
-                         conversation_history.append({"role": "assistant", "content": final_text_segment})
-                    
-                    if final_stop_reason == "max_tokens":
-                        print_system_console_message("Warning: AI's response was cut short. It may try to continue.", is_error=True)
-                        conversation_history.append({"role": "user", "content": "Observation: Your previous response was truncated. Please continue."})
-                        needs_ai_response = True # Re-prompt AI
-                    else:
-                        needs_ai_response = False # AI turn complete if no tool and no truncation
-                    break # End of stream processing
+                if event_type == "text_chunk":
+                    accumulated_text_this_segment.append(data)
+                elif event_type == "tool_call_detected":
+                    preamble_for_tool_call = data 
+                    tool_name, tool_args = extra[0], extra[1]
+                    tool_call_action = (tool_name, tool_args)
+                    logger.info(f"Tool call detected mid-stream: {tool_name}. Preamble: '{preamble_for_tool_call}'")
+                    break 
+                elif event_type == "stream_complete":
+                    final_stop_reason_for_segment = extra[0]
+                    full_segment_text = "".join(accumulated_text_this_segment) if accumulated_text_this_segment else data
+                    if full_segment_text: 
+                         # Print accumulated text before history add
+                         print_ai_message_segment(full_segment_text)
+                         conversation_history.append({"role": "assistant", "content": full_segment_text})
+                    logger.info(f"AI stream segment ended. Reason: {final_stop_reason_for_segment}")
+                    break 
                 elif event_type == "error":
-                    print_ai_message_complete("".join(accumulated_ai_preamble)) # Print what we have
+                    # Print accumulated text before error message
+                    if accumulated_text_this_segment: print_ai_message_segment("".join(accumulated_text_this_segment))
                     print_system_console_message(f"Error from AI stream: {data}", is_error=True)
-                    needs_ai_response = False # Stop this AI turn
+                    if accumulated_text_this_segment:
+                        conversation_history.append({"role": "assistant", "content": "".join(accumulated_text_this_segment)})
+                    needs_ai_to_respond = False 
                     break
-                elif event_type == "interrupted": # Interrupted from within client
-                    print_ai_message_complete("".join(accumulated_ai_preamble))
-                    print_system_console_message("AI stream was interrupted.", is_error=True)
-                    needs_ai_response = False
+                elif event_type == "interrupted":
+                    if accumulated_text_this_segment: print_ai_message_segment("".join(accumulated_text_this_segment))
+                    print_system_console_message(f"AI stream was interrupted: {data}", is_error=True)
+                    if accumulated_text_this_segment:
+                         conversation_history.append({"role": "assistant", "content": "".join(accumulated_text_this_segment)})
+                    needs_ai_to_respond = False
                     break
             
-            if interrupt_handler.is_interrupted(): # If the for-loop broke due to interrupt
-                needs_ai_response = False # Don't try to get more AI response now
+            if not needs_ai_to_respond: break 
 
-            if tool_to_execute:
-                # Add preamble to history (if any) before tool execution observation
-                full_preamble = "".join(accumulated_ai_preamble)
-                print_ai_message_complete(full_preamble) # Ensure newline after preamble
-                if full_preamble:
-                    conversation_history.append({"role": "assistant", "content": full_preamble})
+            if tool_call_action:
+                if preamble_for_tool_call:
+                    print_ai_message_segment(preamble_for_tool_call)
+                    if not any(msg["role"] == "assistant" and msg["content"] == preamble_for_tool_call.strip() for msg in conversation_history[-2:]):
+                         if preamble_for_tool_call.strip():
+                            conversation_history.append({"role": "assistant", "content": preamble_for_tool_call.strip()})
 
-                tool_name, tool_args = tool_to_execute
+                tool_name, tool_args = tool_call_action
                 print_tool_being_used(tool_name, tool_args)
                 tool_output_str = execute_tool(tool_name, tool_args)
 
                 if "User interrupted command confirmation." in tool_output_str and interrupt_handler.is_interrupted():
                     print_system_console_message("Command confirmation was interrupted.")
-                    # Don't add this specific observation, let AI retry based on original user query + history.
-                    # Or, add a specific observation about *confirmation* interruption.
-                    conversation_history.append({"role": "user", "content": f"Observation: I interrupted the confirmation for command: {tool_args.get('command')}"})
-                    needs_ai_response = True # AI needs to react to this specific interruption
-                    continue # Back to top of inner while loop to get AI's reaction
-
-                print_tool_output(tool_name, tool_output_str)
-                observation_content = f"Observation for tool '{tool_name}':\n{tool_output_str}"
-                conversation_history.append({"role": "user", "content": observation_content})
+                    conversation_history.append({"role": "user", "content": f"Observation: I interrupted the confirmation for your request to run '{tool_args.get('command')}'."})
+                else:
+                    print_tool_output(tool_name, tool_output_str)
+                    observation_content = f"Observation for tool '{tool_name}':\n{tool_output_str}"
+                    conversation_history.append({"role": "user", "content": observation_content})
+                    if "Command interrupted." in tool_output_str and interrupt_handler.is_interrupted():
+                         print_system_console_message(f"Tool '{tool_name}' execution was interrupted.")
                 
-                if "Command interrupted." in tool_output_str and interrupt_handler.is_interrupted():
-                     print_system_console_message(f"Tool '{tool_name}' execution was interrupted by user.")
-                
-                needs_ai_response = True # AI needs to respond to this tool's observation
+                needs_ai_to_respond = True 
             
-            # If needs_ai_response is still True, the inner loop continues, re-prompting AI.
-            # If False, inner loop breaks, waiting for next user input.
+            elif final_stop_reason_for_segment == "max_tokens":
+                # Text already printed and added to history by stream_complete handling.
+                print_system_console_message("Warning: AI's response was cut short. It may try to continue.", is_error=True)
+                conversation_history.append({"role": "user", "content": "Observation: Your previous response was truncated. Please continue."})
+                needs_ai_to_respond = True
+            
+            else: 
+                needs_ai_to_respond = False 
 
-    # End of outer `while True` (user input loop)
-    print_system_console_message(f"Exiting {config.SERVICE_NAME}.") # Ensure exit message
+    print_system_console_message(f"Exiting {config.SERVICE_NAME}.")
+
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except SystemExit: pass
     except Exception as e:
         logger.critical(f"--- Main loop critical error: {e} ---", exc_info=True)
         print(f"\n--- CRITICAL ERROR: {e} ---", file=sys.stderr)
     finally:
         logger.info("Application terminated.")
-        # Avoid double printing if already exited cleanly via sys.exit()
-        # if not (sys.exc_info()[0] is None or sys.exc_info()[0] is SystemExit):
-        #      print("\nApplication terminated due to an error.", file=sys.stderr)
-        # else:
-        #      print("\nApplication terminated.") # Already handled by main exit path
+        print("\nApplication terminated.")
