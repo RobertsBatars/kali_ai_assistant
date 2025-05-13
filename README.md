@@ -52,7 +52,7 @@ kali_ai_assistant/
     * Anthropic (required for AI)
     * Google Custom Search API (optional, for Google search)
     * Tavily API (optional, for Tavily search)
-    * Brave Search API (optional, for Brave search)
+    * Brave Search API (optional, for Brave search and CVE search)
 
 ### 2. Clone the Repository (or Create Files)
 
