@@ -3,6 +3,7 @@ import anthropic
 import config # Assuming config.py is in the parent directory or accessible
 import logging
 import json
+import re # Import regex for cleaning
 
 logger = logging.getLogger(f"{config.SERVICE_NAME}.AnthropicClient")
 
@@ -27,7 +28,7 @@ class AnthropicClient:
         """
         Yields responses from the Anthropic API using streaming.
         - Yields ("text_chunk", str_chunk) for text parts.
-        - Yields ("first_tool_call_details", tool_name, tool_args) when the *first* complete 
+        - Yields ("first_tool_call_details", preamble_text, tool_name, tool_args) when the *first* complete 
           tool call is found. The stream processing for this AI response then stops.
         - Yields ("stream_complete", full_text_if_no_tool_call, stop_reason) if stream ends 
           without a tool call being actioned.
@@ -41,9 +42,7 @@ class AnthropicClient:
         
         effective_max_tokens = max_tokens if max_tokens is not None else config.MAX_AI_OUTPUT_TOKENS
         
-        # Buffer to accumulate text across chunks to reliably detect complete tool call tags
         tag_detection_buffer = "" 
-        # List to store all text chunks yielded in this segment (for full message if no tool call)
         all_text_chunks_this_segment = [] 
         tool_call_start_tag = "<tool_call>"
         tool_call_end_tag = "</tool_call>"
@@ -86,22 +85,17 @@ class AnthropicClient:
 
                                     if tool_name and isinstance(tool_args, dict):
                                         logger.info(f"First tool call detected and parsed: {tool_name}")
-                                        yield "first_tool_call_details", tool_name, tool_args
+                                        preamble_text = "".join(all_text_chunks_this_segment).split(tool_call_start_tag)[0].strip()
+                                        yield "first_tool_call_details", preamble_text, tool_name, tool_args
                                         stream.close() 
-                                        return # Stop processing this stream; first tool found
+                                        return 
                                     else:
                                         logger.warning(f"Malformed tool JSON (parsed but invalid structure): {tool_json_str}")
-                                        # This malformed call will be treated as text by the main loop as it continues to stream.
                                 except json.JSONDecodeError as e:
                                     logger.warning(f"JSONDecodeError in tool call: {e}. Content: {tool_json_str}")
-                                    # This unparsable call will be treated as text.
-                                
                                 # If tool call was malformed or unparsable, it's treated as text.
-                                # To prevent re-parsing this invalid block, advance buffer past it.
-                                # This is tricky if we want to find *subsequent valid* tool calls.
-                                # For "act on first *valid* tool call", this is fine.
+                                # Advance buffer past this point to avoid re-parsing the same invalid block.
                                 tag_detection_buffer = tag_detection_buffer[end_idx + len(tool_call_end_tag):]
-
                     elif event.type == "message_stop":
                         final_message = stream.get_final_message()
                         final_stop_reason = final_message.stop_reason if final_message else "unknown_stop"
@@ -111,7 +105,7 @@ class AnthropicClient:
                         return
             
                 # Fallback if loop finishes (e.g. stream closed by interrupt before message_stop)
-                final_message_obj_fallback = stream.get_final_message() # May be None if stream was hard closed
+                final_message_obj_fallback = stream.get_final_message()
                 final_stop_reason_fallback = final_message_obj_fallback.stop_reason if final_message_obj_fallback else "ended_unexpectedly"
                 full_text_fallback = "".join(all_text_chunks_this_segment)
                 logger.info(f"Stream loop exited. Final text: '{full_text_fallback[:100]}...'. Fallback Stop Reason: {final_stop_reason_fallback}")
@@ -123,54 +117,89 @@ class AnthropicClient:
             yield "error", f"Stream error ({error_type}): {e}", error_type
 
     def summarize_conversation(self, conversation_history: list[dict], target_token_count: int) -> str | None:
-        # (This method remains largely the same, but will now use the streaming client internally
-        # and accumulate the summary text)
         if self.interrupted: logger.info("Summarization interrupted."); return None
         if not conversation_history: logger.info("No history to summarize."); return None
 
         summarization_system_prompt = (
-            f"Summarize the following conversation concisely, aiming for {target_token_count} tokens. "
-            "Focus on key facts, decisions, and outcomes. Output ONLY the summary text."
+            "You are an expert summarization AI. Your task is to summarize the provided conversation concisely. "
+            "Focus on key facts, decisions, user requests, and important outcomes. "
+            "The summary should be a coherent narrative text that captures the essence of the conversation. "
+            f"Aim for a summary that is approximately {target_token_count} tokens long. "
+            "Retain critical information, especially unresolved questions or ongoing tasks. "
+            "Your output MUST be ONLY the summary text. Do NOT include any preambles, sign-offs, or structured data like JSON. "
+            "Under NO circumstances should your summary output contain any tool calls (i.e., no `<tool_call>` or `</tool_call>` tags)."
         )
+        
         max_summary_tokens = int(target_token_count * 1.5); 
         if max_summary_tokens < 200: max_summary_tokens = 200
-        if max_summary_tokens > 4096: max_summary_tokens = 4096
+        if max_summary_tokens > 4096: max_summary_tokens = 4096 
         if target_token_count > 4096 : max_summary_tokens = int(target_token_count * 1.2)
         
         logger.info(f"Requesting summarization. Max summary tokens: {max_summary_tokens}")
         
-        accumulated_summary = []
-        final_reason = "error"
+        accumulated_summary_text_chunks = []
+        final_reason_for_summary = "error" 
+        tool_call_was_detected_in_summary = False
+
         for event_type, data, *extra in self.get_response_stream(
             system_prompt=summarization_system_prompt,
             messages=conversation_history,
             max_tokens=max_summary_tokens
         ):
             if event_type == "text_chunk":
-                accumulated_summary.append(data)
+                accumulated_summary_text_chunks.append(data)
             elif event_type == "first_tool_call_details": 
-                logger.warning("Tool call detected during summarization, ignoring.")
-                # This implies the summary itself contained a tool call, which is bad.
-                # We should probably use the text accumulated so far if any.
-                final_reason = "tool_call_in_summary" 
+                preamble_before_tool, tool_name, tool_args = data, extra[0], extra[1]
+                logger.warning(f"Tool call ('{tool_name}') detected during summarization within text: '{preamble_before_tool}'. This is invalid for a summary.")
+                # Also append the preamble text that came before the invalid tool call
+                if preamble_before_tool:
+                    accumulated_summary_text_chunks.append(preamble_before_tool)
+                # And append the problematic tool call itself as text so it can be cleaned
+                malformed_tool_text = f"<tool_call>{json.dumps({'tool_name': tool_name, 'arguments': tool_args})}</tool_call>"
+                accumulated_summary_text_chunks.append(malformed_tool_text)
+                tool_call_was_detected_in_summary = True
+                # Don't break; let the stream finish to capture any text *after* the bad tool call.
+                # The client side `get_response_stream` already stops after the first tool call.
+                # This means the stream will end shortly after this event if the client worked as intended.
+                # However, the client is designed to yield `first_tool_call_details` and then `return`.
+                # This logic here might need to align with how `get_response_stream` behaves when it yields `first_tool_call_details`.
+                # If `get_response_stream` truly stops and returns, this loop will break.
+                # For now, let's assume the stream might continue and we clean up later.
+                # The current `get_response_stream` *does* return after yielding `first_tool_call_details`.
+                # So, this loop will break after this event.
+                final_reason_for_summary = "tool_call_in_summary_attempt"
                 break 
             elif event_type == "stream_complete":
-                final_reason = extra[0] if extra else "unknown_end"
-                # 'data' here is the full_text from the client's buffer for stream_complete
-                if data: # Prefer this fully formed text if available
-                    accumulated_summary = [data] 
+                final_reason_for_summary = extra[0] if extra else "unknown_end"
+                if data: # data is the full text from client's buffer
+                    accumulated_summary_text_chunks = [data] # Prefer this complete text
                 break
             elif event_type in ["error", "interrupted"]:
                 logger.error(f"Summarization stream error/interrupt: {event_type} - {data}")
-                return None
+                return None 
         
-        full_summary_text = "".join(accumulated_summary).strip()
-        if final_reason not in ["error", "interrupted", "tool_call_in_summary"] and full_summary_text:
-            logger.info(f"Summarization successful. Length: {len(full_summary_text)}, Reason: {final_reason}")
+        full_summary_text = "".join(accumulated_summary_text_chunks).strip()
+
+        if tool_call_was_detected_in_summary or \
+           ("<tool_call>" in full_summary_text or "</tool_call>" in full_summary_text):
+            logger.warning(f"Tool call tags were present in the AI's summary attempt. Original text: '{full_summary_text[:300]}...'")
+            # Failsafe: Remove tool calls using regex
+            cleaned_summary_text = re.sub(r"<tool_call>.*?</tool_call>", "", full_summary_text, flags=re.DOTALL).strip()
+            
+            if not cleaned_summary_text:
+                logger.error("Summary is empty after removing tool calls.")
+                return None
+            
+            logger.info(f"Summary cleaned. Original length: {len(full_summary_text)}, Cleaned length: {len(cleaned_summary_text)}. Reason for original issue: {final_reason_for_summary}")
+            return cleaned_summary_text
+        
+        # If no tool calls were detected and stream completed normally
+        if final_reason_for_summary not in ["error", "interrupted"] and full_summary_text:
+            logger.info(f"Summarization successful. Length: {len(full_summary_text)}, Reason: {final_reason_for_summary}")
             return full_summary_text
         
-        logger.warning(f"Summarization failed or no text. Reason: {final_reason}, Text: '{full_summary_text}'")
+        logger.warning(f"Summarization resulted in no text or an unresolved issue. Reason: {final_reason_for_summary}, Final Text: '{full_summary_text[:200]}'")
         return None
 
 # if __name__ == '__main__':
-# ... (Test code would need significant rework to handle the new event types)
+# ... (Test code from previous version, would need updates for the new 'first_tool_call_details' event structure)
