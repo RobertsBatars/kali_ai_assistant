@@ -10,7 +10,7 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").lower() # Default to anthrop
 
 # --- Anthropic API Configuration ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DEFAULT_ANTHROPIC_MODEL = os.getenv("DEFAULT_ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
+DEFAULT_ANTHROPIC_MODEL = os.getenv("DEFAULT_ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 # --- LM Studio Configuration ---
 LM_STUDIO_API_BASE = os.getenv("LM_STUDIO_API_BASE", "http://localhost:1234/v1")
