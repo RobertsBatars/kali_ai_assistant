@@ -1,42 +1,26 @@
-# ai_core/anthropic_client.py
+# ai_core/anthropic_llm_client.py
 import anthropic
-import config # Assuming config.py is in the parent directory or accessible
+import config # Main config from project root
 import logging
 import json
-import re # Import regex for cleaning
+from .base_llm_client import BaseLLMClient # Import from the same directory
 
-logger = logging.getLogger(f"{config.SERVICE_NAME}.AnthropicClient")
+logger = logging.getLogger(f"{config.SERVICE_NAME}.AnthropicLLMClient")
 
-class AnthropicClient:
+class AnthropicLLMClient(BaseLLMClient):
     def __init__(self, api_key=None, model_name=None):
+        super().__init__(model_name or config.DEFAULT_ANTHROPIC_MODEL)
         self.api_key = api_key or config.ANTHROPIC_API_KEY
         if not self.api_key:
-            logger.error("Anthropic API key is not configured.")
-            raise ValueError("Anthropic API key is not configured. Please set ANTHROPIC_API_KEY in your .env file.")
+            logger.error("Anthropic API key is not configured for AnthropicLLMClient.")
+            raise ValueError("Anthropic API key is not configured.")
         
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model_name = model_name or config.DEFAULT_AI_MODEL
-        self.interrupted = False
-        logger.info(f"AnthropicClient initialized with model: {self.model_name}")
-
-    def set_interrupted(self, interrupted_status):
-        if self.interrupted != interrupted_status:
-            logger.debug(f"Interruption status set to: {interrupted_status}")
-        self.interrupted = interrupted_status
+        logger.info(f"AnthropicLLMClient initialized with model: {self.model_name}")
 
     def get_response_stream(self, system_prompt, messages, max_tokens=None):
-        """
-        Yields responses from the Anthropic API using streaming.
-        - Yields ("text_chunk", str_chunk) for text parts.
-        - Yields ("first_tool_call_details", preamble_text, tool_name, tool_args) when the *first* complete 
-          tool call is found. The stream processing for this AI response then stops.
-        - Yields ("stream_complete", full_text_if_no_tool_call, stop_reason) if stream ends 
-          without a tool call being actioned.
-        - Yields ("error", error_message_str, "error_type_str") on API or processing error.
-        - Yields ("interrupted", accumulated_text_before_interrupt, "interrupted_type_str") if interrupted.
-        """
         if self.interrupted:
-            logger.info("AI interaction interrupted before API call.")
+            logger.info("Anthropic stream interrupted before API call.")
             yield "interrupted", "", "interrupted_before_call"
             return
         
@@ -49,10 +33,10 @@ class AnthropicClient:
         
         try:
             if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-                yield "error", "Invalid messages format.", "internal_error"
+                yield "error", "Invalid messages format for Anthropic.", "internal_error"
                 return
 
-            logger.debug(f"Opening stream to Anthropic. Model: {self.model_name}, Max Tokens: {effective_max_tokens}")
+            logger.debug(f"Opening Anthropic stream. Model: {self.model_name}, Max Tokens: {effective_max_tokens}")
             
             with self.client.messages.stream(
                 model=self.model_name,
@@ -62,7 +46,7 @@ class AnthropicClient:
             ) as stream:
                 for event in stream:
                     if self.interrupted:
-                        logger.info("AI stream processing interrupted by flag.")
+                        logger.info("Anthropic stream processing interrupted by flag.")
                         yield "interrupted", "".join(all_text_chunks_this_segment), "interrupted_during_stream"
                         stream.close() 
                         return
@@ -84,39 +68,38 @@ class AnthropicClient:
                                     tool_args = tool_data.get("arguments")
 
                                     if tool_name and isinstance(tool_args, dict):
-                                        logger.info(f"First tool call detected and parsed: {tool_name}")
+                                        logger.info(f"Anthropic: First tool call detected: {tool_name}")
                                         preamble_text = "".join(all_text_chunks_this_segment).split(tool_call_start_tag)[0].strip()
                                         yield "first_tool_call_details", preamble_text, tool_name, tool_args
                                         stream.close() 
                                         return 
-                                    else:
-                                        logger.warning(f"Malformed tool JSON (parsed but invalid structure): {tool_json_str}")
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"JSONDecodeError in tool call: {e}. Content: {tool_json_str}")
-                                # If tool call was malformed or unparsable, it's treated as text.
-                                # Advance buffer past this point to avoid re-parsing the same invalid block.
+                                    # else: Malformed JSON structure, continue treating as text
+                                except json.JSONDecodeError:
+                                    pass # Not a valid JSON, continue treating as text
+                                # If tool call was malformed/unparsable, it's text. Advance buffer.
                                 tag_detection_buffer = tag_detection_buffer[end_idx + len(tool_call_end_tag):]
                     elif event.type == "message_stop":
                         final_message = stream.get_final_message()
                         final_stop_reason = final_message.stop_reason if final_message else "unknown_stop"
                         full_text = "".join(all_text_chunks_this_segment)
-                        logger.info(f"Stream ended by API (message_stop). Stop Reason: {final_stop_reason}. Full text length: {len(full_text)}")
+                        logger.info(f"Anthropic stream ended (message_stop). Stop Reason: {final_stop_reason}. Full text: {len(full_text)} chars")
                         yield "stream_complete", full_text, final_stop_reason
                         return
             
-                # Fallback if loop finishes (e.g. stream closed by interrupt before message_stop)
                 final_message_obj_fallback = stream.get_final_message()
                 final_stop_reason_fallback = final_message_obj_fallback.stop_reason if final_message_obj_fallback else "ended_unexpectedly"
                 full_text_fallback = "".join(all_text_chunks_this_segment)
-                logger.info(f"Stream loop exited. Final text: '{full_text_fallback[:100]}...'. Fallback Stop Reason: {final_stop_reason_fallback}")
+                logger.info(f"Anthropic stream loop exited. Fallback Stop Reason: {final_stop_reason_fallback}")
                 yield "stream_complete", full_text_fallback, final_stop_reason_fallback
 
         except Exception as e:
             error_type = "api_error" if isinstance(e, anthropic.APIError) else "stream_processing_error"
             logger.error(f"Error during Anthropic stream ({error_type}): {e}", exc_info=True)
-            yield "error", f"Stream error ({error_type}): {e}", error_type
-
-    def summarize_conversation(self, conversation_history: list[dict], target_token_count: int) -> str | None:
+            yield "error", f"Anthropic stream error ({error_type}): {e}", error_type
+    
+    def summarize_conversation(self, conversation_history: list, target_token_count: int) -> str | None:
+        # (Logic from your previous anthropic_client.py's summarize_conversation,
+        # ensuring it uses self.get_response_stream correctly)
         if self.interrupted: logger.info("Summarization interrupted."); return None
         if not conversation_history: logger.info("No history to summarize."); return None
 
@@ -129,17 +112,16 @@ class AnthropicClient:
             "Your output MUST be ONLY the summary text. Do NOT include any preambles, sign-offs, or structured data like JSON. "
             "Under NO circumstances should your summary output contain any tool calls (i.e., no `<tool_call>` or `</tool_call>` tags)."
         )
-        
-        max_summary_tokens = int(target_token_count * 1.5); 
+        max_summary_tokens = int(target_token_count * 1.5) 
         if max_summary_tokens < 200: max_summary_tokens = 200
-        if max_summary_tokens > 4096: max_summary_tokens = 4096 
-        if target_token_count > 4096 : max_summary_tokens = int(target_token_count * 1.2)
+        if max_summary_tokens > 4096: max_summary_tokens = 4096
+        if target_token_count > 4096: max_summary_tokens = int(target_token_count * 1.2)
         
-        logger.info(f"Requesting summarization. Max summary tokens: {max_summary_tokens}")
+        logger.info(f"Anthropic: Requesting summarization. Max summary tokens: {max_summary_tokens}")
         
         accumulated_summary_text_chunks = []
         final_reason_for_summary = "error" 
-        tool_call_was_detected_in_summary = False
+        tool_call_detected_in_summary_attempt = False
 
         for event_type, data, *extra in self.get_response_stream(
             system_prompt=summarization_system_prompt,
@@ -150,56 +132,35 @@ class AnthropicClient:
                 accumulated_summary_text_chunks.append(data)
             elif event_type == "first_tool_call_details": 
                 preamble_before_tool, tool_name, tool_args = data, extra[0], extra[1]
-                logger.warning(f"Tool call ('{tool_name}') detected during summarization within text: '{preamble_before_tool}'. This is invalid for a summary.")
-                # Also append the preamble text that came before the invalid tool call
-                if preamble_before_tool:
-                    accumulated_summary_text_chunks.append(preamble_before_tool)
-                # And append the problematic tool call itself as text so it can be cleaned
+                logger.warning(f"Anthropic: Tool call ('{tool_name}') detected during summarization. Invalid.")
+                if preamble_before_tool: accumulated_summary_text_chunks.append(preamble_before_tool)
                 malformed_tool_text = f"<tool_call>{json.dumps({'tool_name': tool_name, 'arguments': tool_args})}</tool_call>"
                 accumulated_summary_text_chunks.append(malformed_tool_text)
-                tool_call_was_detected_in_summary = True
-                # Don't break; let the stream finish to capture any text *after* the bad tool call.
-                # The client side `get_response_stream` already stops after the first tool call.
-                # This means the stream will end shortly after this event if the client worked as intended.
-                # However, the client is designed to yield `first_tool_call_details` and then `return`.
-                # This logic here might need to align with how `get_response_stream` behaves when it yields `first_tool_call_details`.
-                # If `get_response_stream` truly stops and returns, this loop will break.
-                # For now, let's assume the stream might continue and we clean up later.
-                # The current `get_response_stream` *does* return after yielding `first_tool_call_details`.
-                # So, this loop will break after this event.
+                tool_call_detected_in_summary_attempt = True
                 final_reason_for_summary = "tool_call_in_summary_attempt"
                 break 
             elif event_type == "stream_complete":
                 final_reason_for_summary = extra[0] if extra else "unknown_end"
-                if data: # data is the full text from client's buffer
-                    accumulated_summary_text_chunks = [data] # Prefer this complete text
+                if data: accumulated_summary_text_chunks = [data] 
                 break
             elif event_type in ["error", "interrupted"]:
-                logger.error(f"Summarization stream error/interrupt: {event_type} - {data}")
+                logger.error(f"Anthropic: Summarization stream error/interrupt: {event_type} - {data}")
                 return None 
         
         full_summary_text = "".join(accumulated_summary_text_chunks).strip()
 
-        if tool_call_was_detected_in_summary or \
+        if tool_call_detected_in_summary_attempt or \
            ("<tool_call>" in full_summary_text or "</tool_call>" in full_summary_text):
-            logger.warning(f"Tool call tags were present in the AI's summary attempt. Original text: '{full_summary_text[:300]}...'")
-            # Failsafe: Remove tool calls using regex
+            logger.warning(f"Anthropic: Tool call tags present in summary attempt. Original: '{full_summary_text[:300]}...'")
+            import re # Local import for safety
             cleaned_summary_text = re.sub(r"<tool_call>.*?</tool_call>", "", full_summary_text, flags=re.DOTALL).strip()
-            
-            if not cleaned_summary_text:
-                logger.error("Summary is empty after removing tool calls.")
-                return None
-            
-            logger.info(f"Summary cleaned. Original length: {len(full_summary_text)}, Cleaned length: {len(cleaned_summary_text)}. Reason for original issue: {final_reason_for_summary}")
+            if not cleaned_summary_text: logger.error("Anthropic: Summary empty after cleaning tool calls."); return None
+            logger.info(f"Anthropic: Summary cleaned. Length: {len(cleaned_summary_text)}.")
             return cleaned_summary_text
         
-        # If no tool calls were detected and stream completed normally
         if final_reason_for_summary not in ["error", "interrupted"] and full_summary_text:
-            logger.info(f"Summarization successful. Length: {len(full_summary_text)}, Reason: {final_reason_for_summary}")
+            logger.info(f"Anthropic: Summarization successful. Length: {len(full_summary_text)}, Reason: {final_reason_for_summary}")
             return full_summary_text
         
-        logger.warning(f"Summarization resulted in no text or an unresolved issue. Reason: {final_reason_for_summary}, Final Text: '{full_summary_text[:200]}'")
+        logger.warning(f"Anthropic: Summarization failed or no text. Reason: {final_reason_for_summary}, Text: '{full_summary_text[:200]}'")
         return None
-
-# if __name__ == '__main__':
-# ... (Test code from previous version, would need updates for the new 'first_tool_call_details' event structure)
