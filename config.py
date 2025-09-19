@@ -14,7 +14,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 
 # --- AI Configuration ---
-DEFAULT_AI_MODEL = os.getenv("DEFAULT_AI_MODEL", "claude-3-7-sonnet-latest") # Or claude-3-sonnet-20240229 for faster/cheaper testing
+DEFAULT_AI_MODEL = os.getenv("DEFAULT_AI_MODEL", "claude-sonnet-4-20250514") # Or claude-3-sonnet-20240229 for faster/cheaper testing
 MAX_AI_OUTPUT_TOKENS = int(os.getenv("MAX_AI_OUTPUT_TOKENS", 64000)) # User requested, default 2048
 
 # Context summarization settings
